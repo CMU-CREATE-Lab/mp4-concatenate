@@ -181,6 +181,10 @@ class MP4:
         self.fp = open(filename, 'r+' if writable else 'r')
         self.verbose = False
         self.info = self.parse_container()
+        if not 'stss' in self.info['moov']['trak']['mdia']['minf']['stbl']:
+            print '%s missing stss;  synthesizing replacement' % filename
+            self.synthesize_stss_all_keyframes()
+
         print 'Read %s' % filename
         
     def write32(self, val):
@@ -347,6 +351,17 @@ class MP4:
             aw.write32(key_frame_sample)
         return aw.atom()
 
+    # If stss is missing, it means "every sample is implicitly a random access point."  Meaning all frames
+    # are keyframes.  Synthesize stss, assuming all frames are keyframes.
+    def synthesize_stss_all_keyframes(self):
+        num_frames = len(self.info['moov']['trak']['mdia']['minf']['stbl']['stsz']['sample_sizes'])
+        self.info['moov']['trak']['mdia']['minf']['stbl']['stss'] = {
+            'atomtype': 'stss',
+            'version': '\x00',
+            'flags': '\x00' * 3,
+            'key_frame_samples': list(range(1, num_frames + 1))
+        }
+
     # Time to sample
     def parse_stts(self, ar):
         ar.read_version_and_flags()
@@ -384,7 +399,7 @@ class MP4:
             parser_name = 'parse_' + ar.atomtype
             if parser_name in dir(self):
                 if self.verbose:
-                    print 'Found %s size %d' % (prefix + atomtype, atomsize)
+                    print 'Found %s size %d' % (prefix + ar.atomtype, ar.atomsize)
                 getattr(self, parser_name)(ar)
                 val = ar.done()
                 test_unparse = False
@@ -447,14 +462,20 @@ class MP4:
                     return key + '.' + ret
         return None
     
+    # Pixel dimensions
+    def dimensions(self):
+        return [self.info['moov']['trak']['tkhd']['track_width'], self.info['moov']['trak']['tkhd']['track_height']]
+                
     def copy_with_padding(self, dest, padding):
         moov = copy.deepcopy(self.info['moov'])
-        new_mdat_location = (self.info['ftyp']['atomsize'] +
-                             self.info['moov']['atomsize'] +
+        new_mdat_location = (len(self.write_atom(self.info['ftyp'])) +
+                             len(self.write_atom(self.info['moov'])) +
                              8 +
                              padding)
+        
         mdat_move = new_mdat_location - self.info['mdat']['_position']
-        print 'Moving mdat by %d bytes' % mdat_move
+        if self.verbose:
+            print 'Moving mdat by %d bytes' % mdat_move
         stco = moov['trak']['mdia']['minf']['stbl']['stco']
         chunk_offsets = stco['chunk_offsets']
         for i in range(0, len(chunk_offsets)):
@@ -487,7 +508,11 @@ class MP4:
         
         if not self.writable:
             raise Exception('Please instantiate MP4 with writable=True in order to call update_in_place_with_chunks')
-        
+
+        for chunk in chunks[1:]:
+            if chunks[0].video.dimensions() != chunk.video.dimensions():
+                raise Exception('All videos must have same pixel dimensions')
+
         # Make sure video has moov, free, mdat in that order
         if not 'free' in self.info:
             raise NeedsRewriteException('missing free section')
@@ -598,11 +623,13 @@ class MP4:
         # Rewrite moov and free
 
         self.fp.seek(moov['_position'])
-        print 'Writing moov (%d bytes) at position %d' % (len(moov_out), self.fp.tell())
+        if self.verbose:
+            print 'Writing moov (%d bytes) at position %d' % (len(moov_out), self.fp.tell())
         self.fp.write(moov_out)
         
-        print 'Writing free (%d bytes) at position %d (end=%d)' % (free_len + 8, self.fp.tell(), 
-                                                                   self.fp.tell() + free_len + 8)
+        if self.verbose:
+            print 'Writing free (%d bytes) at position %d (end=%d)' % (free_len + 8, self.fp.tell(), 
+                                                                       self.fp.tell() + free_len + 8)
         self.fp.write(self.write_free_atom(free_len))
         assert self.fp.tell() == self.info['mdat']['_position']
 
