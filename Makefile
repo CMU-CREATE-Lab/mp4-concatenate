@@ -1,4 +1,4 @@
-test: test-short test-no-stss test-unequal-sizes
+test: test-short test-no-stss test-unequal-sizes test-trailer
 
 test-short:
 	cp short.mp4 test-short.mp4
@@ -13,6 +13,13 @@ test-unequal-sizes:
 	echo 'Expecting exception from trying to concatenate videos of different sizes'
 	! ./Concatenate-mp4-videos.py test-unequal-sizes.mp4 unequal-size.mp4
 	echo 'Success (exception happened, as expected)'
+
+test-trailer:
+	cp no-stss.mp4 test-no-stss-trailer.mp4
+	./concatenate-mp4-videos.py test-no-stss-trailer.mp4 trailer.mp4
+	cp short.mp4 test-short-trailer.mp4
+	./concatenate-mp4-videos.py test-short-trailer.mp4 trailer.mp4
+
 
 
 
