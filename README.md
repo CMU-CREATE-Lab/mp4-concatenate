@@ -32,3 +32,8 @@ Using python-style slice syntax, you can concatenate portions of videos.
 Concatenate all but last chunk of a.mp4, plus first chunk of b.mp4, plus all of c.mp4, into a.mp4:
 
     Concatenate-mp4-videos.py 'a.mp4[0:-1]' 'b.mp4[0:1]' c.mp4
+
+Debug tools
+-----------
+
+    ffprobe -i video.mp4 -show_packets

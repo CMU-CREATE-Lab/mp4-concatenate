@@ -57,18 +57,20 @@
 
 # In[1]:
 
-import copy, json, os, pprint, re, StringIO, struct, urllib
+import copy, hashlib, json, os, pprint, re, StringIO, struct, urllib
 from collections import OrderedDict
 
 # In[2]:
 
 class AtomWriter:
     def __init__(self, atom):
+        self.atomtype = atom['atomtype']
         self.out = StringIO.StringIO()
-        self.write(atom['atomtype'])
+        self.write(self.atomtype)
         self.write(atom['version'])
         self.write(atom['flags'])
         assert len(self.out.getvalue()) == 8
+        self.verbose = False
     
     def write16(self, val):
         self.write(struct.pack('!H', val))
@@ -79,9 +81,16 @@ class AtomWriter:
     def write(self, bytes):
         self.out.write(bytes)
 
+    def len(self):
+        return len(self.out.getvalue()) + 4
+
     def atom(self):
         data = self.out.getvalue()
-        return struct.pack('!I', 4 + len(data)) + data
+        ret = struct.pack('!I', 4 + len(data)) + data
+        if self.verbose:
+            hex_encoded = ' '.join('%02x' % ord(c) for c in ret)
+            print 'Created %s, len %d: %s' % (self.atomtype, len(ret), hex_encoded)
+        return ret
 
 class AtomReader:
     def __init__(self, inp):
@@ -96,7 +105,13 @@ class AtomReader:
         }
         self.verbose = False
         if self.verbose:
-            print 'Reading %s (length %d) from position %d' % (self.atomtype, self.atomsize, self.position)
+            pos = inp.tell()
+            inp.seek(self.position)
+            data = inp.read(self.atomsize)[:1000]
+            inp.seek(pos)
+            hex_encoded = ' '.join('%02x' % ord(c) for c in data)
+            print ('Reading %s (length %d) from position %d: %s' %
+                   (self.atomtype, self.atomsize, self.position, hex_encoded))
     
     def read(self, n):
         return self.inp.read(n)
@@ -135,23 +150,35 @@ class Chunk:
         chunk_offsets = video.info['moov']['trak']['mdia']['minf']['stbl']['stco']['chunk_offsets']
         self.offset = chunk_offsets[chunkno]
         # Compute first and last sample #s
+        self.verbose = False
+        if self.verbose:
+            print 'Creating chunk %d from video %s' % (chunkno, video.filename)
         self._compute_samples()
+        sample_descriptions = video.info['moov']['trak']['mdia']['minf']['stbl']['stsd']['sample_descriptions']
+        self.sample_description = sample_descriptions[video.chunk_info(chunkno)['sample_description_id'] - 1]
+
+    # Dump information about chunk and all frames
+    def dump(self):
+        print self
+        self.video.fp.seek(self.offset)
+        for frameno in range(self.first_sample, self.first_sample + len(self.sample_sizes)):
+            sample_size = self.sample_sizes[frameno - self.first_sample]
+            data = self.video.fp.read(sample_size)
+            hex_encoded = ' '.join('%02x' % ord(c) for c in data)
+            print 'Frame %d, size %d: %s' % (frameno, sample_size, hex_encoded)
         
     def _compute_samples(self):
-        # Find first (includisve) and last (exclusive) sample #s
-        sample_to_chunk_map = self.video.info['moov']['trak']['mdia']['minf']['stbl']['stsc']['sample_to_chunk_map']
+        # Find first (inclusive) and last (exclusive) sample #s
         last_sample = 0
         first_sample = 0
         for i in range(0, self.chunkno + 1):
-            chunk_info = sample_to_chunk_map[i]
-            assert chunk_info['first_chunk'] == i + 1
-            assert chunk_info['sample_description_id'] == 1
             first_sample = last_sample
-            last_sample += chunk_info['samples_per_chunk']
+            last_sample += self.video.chunk_info(i)['samples_per_chunk']
         
         # Find sample sizes
         sample_sizes = self.video.info['moov']['trak']['mdia']['minf']['stbl']['stsz']['sample_sizes']
         self.sample_sizes = sample_sizes[first_sample : last_sample]
+        self.first_sample = first_sample
         self.length = sum(self.sample_sizes)
         
         # Find keyframes
@@ -163,12 +190,14 @@ class Chunk:
                 self.keyframes.append(key_frame_sample - first_sample)
         
     def __repr__(self):
-        return ('Chunk(video=%s, index=%d, offset=%d, nsamples=%d, length=%d)' % 
+        sample_description_hash = hashlib.sha224(self.sample_description['format'] + self.sample_description['unparsed']).hexdigest()
+        return ('Chunk(video=%s, index=%d, offset=%d, nsamples=%d, length=%d, sample_description=%s)' % 
                 (self.video.filename, self.chunkno, self.offset, 
-                 len(self.sample_sizes), self.length))
+                 len(self.sample_sizes), self.length,
+                 sample_description_hash[:8]))
 
 class NeedsRewriteException(Exception):
-    def __init__(self, why, space_needed):
+    def __init__(self, why, space_needed=0):
         self.value = 'Video needs rewriting because %s (space needed=%d)' % (why, space_needed)
         self.space_needed = space_needed
     def __str__(self):
@@ -325,6 +354,17 @@ class MP4:
             ret.append(entry)
         ar.set('sample_to_chunk_map', ret)
 
+    # chunkno is 0-based
+    def chunk_info(self, chunkno):
+        sample_to_chunk_map = self.info['moov']['trak']['mdia']['minf']['stbl']['stsc']['sample_to_chunk_map']
+        info = sample_to_chunk_map[0]
+        assert info['first_chunk'] == 1
+        for i in sample_to_chunk_map[1:]:
+            if (i['first_chunk'] <= chunkno + 1 and
+                i['first_chunk'] > info['first_chunk']):
+                info = i
+        return info
+
     def unparse_stsc(self, atom):
         aw = AtomWriter(atom)
         aw.write32(len(atom['sample_to_chunk_map']))
@@ -382,7 +422,57 @@ class MP4:
             aw.write32(entry['sample_count'])
             aw.write32(entry['sample_duration'])
         return aw.atom()
+
+    # sample type
+    def parse_stsd(self, ar):
+        ar.read_version_and_flags()
+        num = ar.read32()
+        sample_descriptions = []
+        for i in range(0, num):
+            description = {}
+            len = ar.read32()
+            description['format'] = ar.read(6)
+            description['reserved'] = ar.read(6) # Apple spec says all zeros, but I'm seeing otherwise
+            description['reference_index'] = ar.read16()
+            assert(description['reference_index'] == 0) # for now, can only handle this
+            description['unparsed'] = ar.read(len - 4 - 6 - 6 - 2)
+            sample_descriptions.append(description)
+        ar.set('sample_descriptions', sample_descriptions)
+
+    # sample type
+    def unparse_stsd(self, atom):
+        aw = AtomWriter(atom)
+        aw.write32(len(atom['sample_descriptions']))
+        for description in atom['sample_descriptions']:
+            before = aw.len()
+            desc_len = 4 + 6 + 6 + 2 + len(description['unparsed'])
+            aw.write32(desc_len)
+            assert(len(description['format']) == 6)
+            aw.write(description['format'])
+            assert(len(description['reserved']) == 6)
+            aw.write(description['reserved'])
+            aw.write16(description['reference_index'])
+            aw.write(description['unparsed'])
+            assert desc_len == aw.len() - before
+        return aw.atom()
+
+    # data reference
+    def parse_dref(self, ar):
+        ar.read_version_and_flags()
+        num = ar.read32()
+        assert(num == 1) # for now, can only cope with 1 data reference
+        data_references = []
+        for i in range(0, num):
+            reference = {}
+            len = ar.read32()
+            reference['type'] = ar.read(4)
+            reference['version'] = ar.read(1)
+            reference['flags'] = ar.read(3)
+            reference['data'] = ar.read(len - 4 - 4 - 1 - 3)
+            data_references.append(reference)
+        ar.set('data_references', data_references)
     
+
     def parse_container(self, offset0=0, offset1=None, prefix=''):
         "Walk the atom tree in a mp4 file"
         if offset1 == None:
@@ -565,14 +655,20 @@ class MP4:
            stsz['sample_sizes'].extend(chunk.sample_sizes)
 
         # Construct new list of entries for stsc (chunk to sample map)
+        # Construct new list of sample types for stsd (sample description list)
         stsc = moov['trak']['mdia']['minf']['stbl']['stsc']
         stsc['sample_to_chunk_map'] = []
+        sample_descriptions = []
         for (i, chunk) in enumerate(chunks):
+            if chunk.sample_description not in sample_descriptions:
+                sample_descriptions.append(chunk.sample_description)
             stsc['sample_to_chunk_map'].append({
                 'first_chunk': i + 1,
                 'samples_per_chunk': len(chunk.sample_sizes),
-                'sample_description_id': 1
+                'sample_description_id': sample_descriptions.index(chunk.sample_description) + 1
             })
+        stsd = moov['trak']['mdia']['minf']['stbl']['stsd']
+        stsd['sample_descriptions'] = sample_descriptions
 
         # Construct new list of keyframes for stss (keyframe list)
         stss = moov['trak']['mdia']['minf']['stbl']['stss']
@@ -590,7 +686,7 @@ class MP4:
         
         # Create new moov section
         moov_out = self.write_atom(moov)
-        free_len = self.info['mdat']['_position'] - moov['_position'] - len(moov_out) - 8
+        free_len = self.info['mdat'][ '_position'] - moov['_position'] - len(moov_out) - 8
         if free_len < 0:
             raise NeedsRewriteException('not enough free space', -free_len)
 
@@ -652,6 +748,10 @@ def parse_filename_and_chunks(filename, writable=False):
 
 # In[8]:
 
+def dump_frames(filename_and_chunk):
+    for chunk in parse_filename_and_chunks(filename_and_chunk, writable=False):
+        chunk.dump()
+
 def append(filenames_and_chunks, future_frames=1000):
     while True:
         chunks = parse_filename_and_chunks(filenames_and_chunks[0], writable=True)
@@ -664,7 +764,6 @@ def append(filenames_and_chunks, future_frames=1000):
         try:
             dest.update_in_place_using_chunks(chunks)
         except NeedsRewriteException as e:
-            print e
             # Assume approx 6 bytes per frame
             padding = max(future_frames * 6, dest.info['moov']['atomsize'])
             free = e.space_needed + padding
@@ -693,9 +792,15 @@ def main():
                         help='an integer for the accumulator')
     parser.add_argument('--future_frames', default=1000,
                         help='Specify number of frames for future appending (to better estimate freespace)')
+    parser.add_argument('--dump_frames', action='store_true')
     
     args = parser.parse_args()
-    append(args.filenames_and_chunks, args.future_frames)
+    if args.dump_frames:
+        if len(args.filenames_and_chunks) != 1:
+            raise Exception('Must have one video for --dump_frames')
+        dump_frames(args.filenames_and_chunks[0])
+    else:
+        append(args.filenames_and_chunks, int(args.future_frames))
 
 if __name__ == "__main__":
     main()
