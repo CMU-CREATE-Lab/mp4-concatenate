@@ -131,13 +131,15 @@ class Chunk:
             key_frame_sample -= 1  # from 1-based to 0-based
             if first_sample <= key_frame_sample and key_frame_sample < last_sample:
                 self.keyframes.append(key_frame_sample - first_sample)
+
+    def sample_description_hash(self):
+        return hashlib.sha224(self.sample_description['format'] + self.sample_description['unparsed']).hexdigest()[:8]
         
     def __repr__(self):
-        sample_description_hash = hashlib.sha224(self.sample_description['format'] + self.sample_description['unparsed']).hexdigest()
         return ('Chunk(video=%s, index=%d, offset=%d, nsamples=%d, length=%d, sample_description=%s)' % 
                 (self.video.filename, self.chunkno, self.offset, 
                  len(self.sample_sizes), self.length,
-                 sample_description_hash[:8]))
+                 self.sample_description_hash()))
 
 class NeedsRewriteException(Exception):
     def __init__(self, why, space_needed=0):
