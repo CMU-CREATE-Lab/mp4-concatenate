@@ -152,6 +152,7 @@ class MP4:
     def __init__(self, filename, writable=False):
         self.writable = writable
         self.filename = filename
+        self.chunk_info_cache = {}
         self.fp = open(filename, 'r+' if writable else 'r')
         self.verbose = False
         self.info = self.parse_container()
@@ -300,7 +301,10 @@ class MP4:
         ar.set('sample_to_chunk_map', ret)
 
     # chunkno is 0-based
+
     def chunk_info(self, chunkno):
+        if chunkno in self.chunk_info_cache:
+            return self.chunk_info_cache[chunkno]
         sample_to_chunk_map = self.info['moov']['trak']['mdia']['minf']['stbl']['stsc']['sample_to_chunk_map']
         info = sample_to_chunk_map[0]
         assert info['first_chunk'] == 1
@@ -308,6 +312,7 @@ class MP4:
             if (i['first_chunk'] <= chunkno + 1 and
                 i['first_chunk'] > info['first_chunk']):
                 info = i
+        self.chunk_info_cache[chunkno] = info
         return info
 
     def unparse_stsc(self, atom):
